@@ -67,7 +67,7 @@ jobs:
           JLCPCB_SECRET_KEY: ${{ secrets.JLCPCB_SECRET_KEY }}
         run: |
           minutes=${{ inputs.fetch_minutes || '60' }}
-          jlcparts fetchdb --no-website-enrich --limit 0 \
+          jlcparts fetchdb --verbose --no-website-enrich --limit 0 \
                            --checkpoint parts.checkpoint.json \
                            --max-seconds $((minutes * 60)) \
                            cache.sqlite3
