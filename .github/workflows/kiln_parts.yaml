@@ -1,0 +1,108 @@
+name: "Kiln parts data"
+on:
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Publish even if the part count dropped sharply"
+        type: boolean
+        default: false
+      fetch_minutes:
+        description: "Minutes to spend advancing the full-catalog crawl"
+        default: "60"
+permissions:
+  contents: read
+concurrency:
+  group: kiln-parts
+  cancel-in-progress: false
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: auto
+  # R2 rejects the integrity checksums newer AWS CLIs send by default.
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+  AWS_ENDPOINT_URL: https://${{ vars.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+  CACHE: s3://caldera-parts-cache
+  PUBLISH: s3://caldera-releases/tools/kiln/parts
+  KEEP_CACHES: 5
+jobs:
+  update:
+    name: "Crawl, build and publish"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          sudo apt-get install -y --no-install-recommends p7zip-full zip
+          pip install -e .
+      # The cache is the crawl's only state. Any failure to restore it fails the run: starting
+      # over from an empty database is what destroyed the upstream dataset.
+      - name: Restore cache
+        run: |
+          set -euo pipefail
+          prefix=$(aws s3 cp "$CACHE/LATEST" -)
+          echo "restoring $prefix"
+          aws s3 cp --recursive --no-progress "$CACHE/$prefix/" restore/
+          7z x -y restore/cache.zip > /dev/null
+          test -s cache.sqlite3
+          if [ -f restore/parts.checkpoint.json ]; then cp restore/parts.checkpoint.json .; fi
+          rm -rf restore
+          jlcparts migratecache cache.sqlite3
+      # Advances a resumable pass over the whole catalog. It keeps out-of-stock parts and joint
+      # counts current and drops parts JLC no longer lists; a failure here leaves the nightly
+      # in-stock refresh below unaffected.
+      - name: Advance full-catalog crawl
+        continue-on-error: true
+        env:
+          JLCPCB_APP_ID: ${{ secrets.JLCPCB_APP_ID }}
+          JLCPCB_ACCESS_KEY: ${{ secrets.JLCPCB_ACCESS_KEY }}
+          JLCPCB_SECRET_KEY: ${{ secrets.JLCPCB_SECRET_KEY }}
+        run: |
+          minutes=${{ inputs.fetch_minutes || '60' }}
+          jlcparts fetchdb --no-website-enrich --limit 0 \
+                           --checkpoint parts.checkpoint.json \
+                           --max-seconds $((minutes * 60)) \
+                           cache.sqlite3
+      # Runs after the full crawl so its fresher stock, price and English package names win.
+      - name: Refresh in-stock parts
+        env:
+          JLCPCB_APP_ID: ${{ secrets.JLCPCB_APP_ID }}
+          JLCPCB_ACCESS_KEY: ${{ secrets.JLCPCB_ACCESS_KEY }}
+          JLCPCB_SECRET_KEY: ${{ secrets.JLCPCB_SECRET_KEY }}
+        run: jlcparts fetchinstock cache.sqlite3
+      - name: Save cache
+        run: |
+          set -euo pipefail
+          prefix="$(date -u +%Y-%m-%d)-$GITHUB_RUN_ID"
+          mkdir save
+          zip -q -s 50m save/cache.zip cache.sqlite3
+          if [ -f parts.checkpoint.json ]; then cp parts.checkpoint.json save/; fi
+          aws s3 cp --recursive --no-progress save/ "$CACHE/$prefix/"
+          printf %s "$prefix" | aws s3 cp - "$CACHE/LATEST"
+          rm -rf save
+          # Keep the newest few for rollback: point LATEST at an older prefix to restore it.
+          # Sorted by date, ignoring the seed- prefix of the hand-restored first cache.
+          aws s3 ls "$CACHE/" | awk '/PRE /{print $2}' | tr -d / \
+            | grep -E '^(seed-)?[0-9]{4}-[0-9]{2}-[0-9]{2}' \
+            | awk '{d=$0; sub(/^seed-/, "", d); print d "\t" $0}' | sort -r | cut -f2 \
+            | tail -n +$((KEEP_CACHES + 1)) \
+            | while read -r old; do aws s3 rm --recursive --quiet "$CACHE/$old/"; done
+      - name: Build tables
+        run: jlcparts buildtables --jobs 0 --ignoreoldstock 120 cache.sqlite3 data
+      # Read over the S3 API rather than the public URL, which sits behind Cloudflare's bot checks.
+      - name: Check build
+        run: |
+          if aws s3 ls "$PUBLISH/manifest.json" > /dev/null; then
+            aws s3 cp --no-progress "$PUBLISH/manifest.json" published-manifest.json
+          fi
+          python scripts/kiln/check_manifest.py data/manifest.json published-manifest.json ${{ inputs.force && '--force' || '' }}
+      - name: Publish
+        run: scripts/kiln/publish.sh data "$PUBLISH"
