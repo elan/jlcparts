@@ -127,9 +127,11 @@ def getLibrary(source, db, age, limit, partial, skip):
     help="Retry failed JLCPCB API pages this many times")
 @click.option("--retry-delay", type=int, default=5,
     help="Wait this many seconds between JLCPCB API retries")
+@click.option("--website-enrich/--no-website-enrich", default=True,
+    help="Look up each fetched part on the JLC website for attrition and assembly data")
 @click.option("--verbose", is_flag=True,
     help="Be verbose")
-def fetchDb(db, checkpoint, max_seconds, age, limit, retries, retry_delay, verbose):
+def fetchDb(db, checkpoint, max_seconds, age, limit, retries, retry_delay, website_enrich, verbose):
     """
     Fetch JLC PCB component data directly into DB.
     """
@@ -191,7 +193,8 @@ def fetchDb(db, checkpoint, max_seconds, age, limit, retries, retry_delay, verbo
             done = True
             break
 
-        page = enrichComponentsFromWebsite(page)
+        if website_enrich:
+            page = enrichComponentsFromWebsite(page)
 
         with lib.startTransaction():
             for apiComponent in page:
@@ -209,6 +212,37 @@ def fetchDb(db, checkpoint, max_seconds, age, limit, retries, retry_delay, verbo
     if verbose:
         print("Fetch complete" if done else "Fetch checkpointed")
 
+
+
+@click.command()
+@click.argument("db", type=click.Path(dir_okay=False, exists=True, writable=True))
+@click.option("--workers", type=int, default=2,
+    help="Categories walked at once")
+@click.option("--throttle", type=float, default=0.3,
+    help="Seconds between pages per worker")
+def fetchInStock(db, workers, throttle):
+    """
+    Refresh every in-stock part in DB from the JLC website, and mark the rest out of stock.
+    """
+    from .instock import fetchInStock as walkInStock
+    from .jlcpcb import (JLCPCB_COMPONENT_DETAIL_PATH, JLCPCB_ACCESS_KEY, JLCPCB_APP_ID,
+                         JLCPCB_SECRET_KEY, JlcPcbInterface)
+
+    officialDetails = None
+    if JLCPCB_APP_ID and JLCPCB_ACCESS_KEY and JLCPCB_SECRET_KEY:
+        interf = JlcPcbInterface(JLCPCB_APP_ID, JLCPCB_ACCESS_KEY, JLCPCB_SECRET_KEY)
+
+        def officialDetails(codes):
+            # Unlike JlcPcbInterface._getComponentDetails, tolerate codes the OpenAPI lacks.
+            for i in range(0, len(codes), 1000):
+                data = interf._post(JLCPCB_COMPONENT_DETAIL_PATH,
+                                    {"componentCodes": codes[i:i + 1000]})["data"]
+                if isinstance(data, dict):
+                    data = data.get("componentDetailResponseVOList", [])
+                yield from data
+
+    lib = SourceDb(db)
+    walkInStock(lib, workers=workers, throttle=throttle, officialDetails=officialDetails)
 
 
 @click.command()
@@ -334,6 +368,7 @@ cli.add_command(updatePreferred)
 cli.add_command(migratecache)
 cli.add_command(fetchDetails)
 cli.add_command(fetchDb)
+cli.add_command(fetchInStock)
 cli.add_command(fetchTable)
 cli.add_command(testComponent)
 

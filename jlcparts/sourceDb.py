@@ -418,12 +418,15 @@ class SourceDb:
                 price = excluded.price,
                 attributes = excluded.attributes,
                 rohs = excluded.rohs,
-                eccn = excluded.eccn,
-                assembly = excluded.assembly,
-                assembly_process = excluded.assembly_process,
-                assembly_mode = excluded.assembly_mode,
-                website_component_id = excluded.website_component_id,
-                attrition = excluded.attrition
+                -- Each source carries only some of these: the OpenAPI has no attrition or
+                -- assembly process, the website list has no ECCN. Keep what we already know
+                -- rather than blanking it whenever the other source refreshes the part.
+                eccn = COALESCE(NULLIF(excluded.eccn, ''), jlc_components.eccn),
+                assembly = COALESCE(excluded.assembly, jlc_components.assembly),
+                assembly_process = COALESCE(excluded.assembly_process, jlc_components.assembly_process),
+                assembly_mode = COALESCE(excluded.assembly_mode, jlc_components.assembly_mode),
+                website_component_id = COALESCE(excluded.website_component_id, jlc_components.website_component_id),
+                attrition = json_patch(COALESCE(NULLIF(jlc_components.attrition, ''), '{}'), excluded.attrition)
             """, (
                 row["lcsc"], now, present, syncSeen, row["category"], row["subcategory"],
                 row["mfr"], row["package"], row["joints"], row["manufacturer"],
@@ -486,6 +489,31 @@ class SourceDb:
             LIMIT ?
             """, (count,))
         return map(lambda row: lcscFromDb(row["lcsc"]), cursor)
+
+    def solderJoints(self, lcscNumbers):
+        """Known joint counts by LCSC code. The website list doesn't carry them."""
+        out = {}
+        codes = [lcscToDb(x) for x in lcscNumbers]
+        for i in range(0, len(codes), 900):
+            chunk = codes[i:i + 900]
+            for row in self.conn.execute(
+                    f"SELECT lcsc, joints FROM jlc_components WHERE lcsc IN ({','.join('?' * len(chunk))})",
+                    chunk):
+                out[row["lcsc"]] = row["joints"]
+        return out
+
+    def zeroStockExcept(self, lcscSet):
+        """Mark every part not in lcscSet out of stock. Only valid after a complete in-stock walk."""
+        self.conn.execute("CREATE TEMP TABLE IF NOT EXISTS in_stock (lcsc INTEGER PRIMARY KEY)")
+        self.conn.execute("DELETE FROM in_stock")
+        self.conn.executemany("INSERT OR IGNORE INTO in_stock VALUES (?)",
+                              ((lcscToDb(x),) for x in lcscSet))
+        cursor = self.conn.execute("""
+            UPDATE jlc_components SET stock = 0
+            WHERE stock != 0 AND lcsc NOT IN (SELECT lcsc FROM in_stock)
+            """)
+        self._commit()
+        return cursor.rowcount
 
     def setPreferred(self, lcscSet):
         self.conn.execute("UPDATE jlc_components SET preferred = 0")
