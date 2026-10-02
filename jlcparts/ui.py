@@ -6,6 +6,7 @@ import time
 import click
 
 from jlcparts.datatables import buildtables, normalizeAttribute
+from jlcparts.kilncatalog import buildKiln
 from jlcparts.lcsc import pullPreferredComponents
 from jlcparts.partLib import (PartLibrary, PartLibraryDb, getLcscExtraNew,
                               loadJlcTable, loadJlcTableLazy, parsePrice)
@@ -369,6 +370,7 @@ cli.add_command(migratecache)
 cli.add_command(fetchDetails)
 cli.add_command(fetchDb)
 cli.add_command(fetchInStock)
+cli.add_command(buildKiln)
 cli.add_command(fetchTable)
 cli.add_command(testComponent)
 

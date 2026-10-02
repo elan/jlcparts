@@ -8,6 +8,10 @@ on:
         description: "Publish even if the part count dropped sharply"
         type: boolean
         default: false
+      snapshot:
+        description: "Publish a full snapshot instead of a change file"
+        type: boolean
+        default: false
       fetch_minutes:
         description: "Minutes to spend advancing the full-catalog crawl"
         default: "60"
@@ -25,7 +29,7 @@ env:
   AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
   AWS_ENDPOINT_URL: https://${{ vars.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
   CACHE: s3://caldera-parts-cache
-  PUBLISH: s3://caldera-releases/tools/kiln/parts
+  CATALOG: s3://caldera-releases/tools/kiln/catalog
   KEEP_CACHES: 5
 jobs:
   update:
@@ -95,14 +99,13 @@ jobs:
             | awk '{d=$0; sub(/^seed-/, "", d); print d "\t" $0}' | sort -r | cut -f2 \
             | tail -n +$((KEEP_CACHES + 1)) \
             | while read -r old; do aws s3 rm --recursive --quiet "$CACHE/$old/"; done
-      - name: Build tables
-        run: jlcparts buildtables --jobs 0 --ignoreoldstock 120 cache.sqlite3 data
-      # Read over the S3 API rather than the public URL, which sits behind Cloudflare's bot checks.
-      - name: Check build
+      # The published catalog is also the builder's state: it replays the snapshot and change files
+      # to learn what an up-to-date Kiln holds, then writes the difference (or a fresh snapshot).
+      - name: Fetch published catalog
+        run: aws s3 cp --recursive --no-progress "$CATALOG/" previous/
+      - name: Build catalog
         run: |
-          if aws s3 ls "$PUBLISH/manifest.json" > /dev/null; then
-            aws s3 cp --no-progress "$PUBLISH/manifest.json" published-manifest.json
-          fi
-          python scripts/kiln/check_manifest.py data/manifest.json published-manifest.json ${{ inputs.force && '--force' || '' }}
+          jlcparts buildkiln cache.sqlite3 out --previous previous \
+            ${{ inputs.snapshot && '--snapshot' || '' }} ${{ inputs.force && '--force' || '' }}
       - name: Publish
-        run: scripts/kiln/publish.sh data "$PUBLISH"
+        run: chmod +x scripts/kiln/publish_catalog.sh && scripts/kiln/publish_catalog.sh out "$CATALOG"
