@@ -8,10 +8,6 @@ on:
         description: "Publish even if the part count dropped sharply"
         type: boolean
         default: false
-      snapshot:
-        description: "Publish a full snapshot instead of a change file"
-        type: boolean
-        default: false
       fetch_minutes:
         description: "Minutes to spend advancing the full-catalog crawl"
         default: "60"
@@ -99,13 +95,13 @@ jobs:
             | awk '{d=$0; sub(/^seed-/, "", d); print d "\t" $0}' | sort -r | cut -f2 \
             | tail -n +$((KEEP_CACHES + 1)) \
             | while read -r old; do aws s3 rm --recursive --quiet "$CACHE/$old/"; done
-      # The published catalog is also the builder's state: it replays the snapshot and change files
-      # to learn what an up-to-date Kiln holds, then writes the difference (or a fresh snapshot).
-      - name: Fetch published catalog
-        run: aws s3 cp --recursive --no-progress "$CATALOG/" previous/
-      - name: Build catalog
+      # Read over the S3 API rather than the public URL, which sits behind Cloudflare's bot checks.
+      - name: Fetch published index
         run: |
-          jlcparts buildkiln cache.sqlite3 out --previous previous \
-            ${{ inputs.snapshot && '--snapshot' || '' }} ${{ inputs.force && '--force' || '' }}
+          if aws s3 ls "$CATALOG/index.json" > /dev/null; then
+            aws s3 cp --no-progress "$CATALOG/index.json" published-index.json
+          fi
+      - name: Build catalog
+        run: jlcparts buildkiln cache.sqlite3 out --previous published-index.json ${{ inputs.force && '--force' || '' }}
       - name: Publish
         run: chmod +x scripts/kiln/publish_catalog.sh && scripts/kiln/publish_catalog.sh out "$CATALOG"
